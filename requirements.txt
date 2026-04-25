@@ -1,0 +1,9 @@
+langgraph>=0.0.26
+langchain-openai>=0.0.5
+cryptography>=42.0.0
+numpy>=1.26.0
+lancedb>=0.5.0
+streamlit>=1.31.0
+pytest>=8.0.0
+pytest-asyncio>=0.25.0
+pydantic>=2.5.0
