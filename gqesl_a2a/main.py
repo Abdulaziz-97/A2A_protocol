@@ -15,21 +15,12 @@ import time
 
 import numpy as np
 
-from gqesl_a2a import config
 from gqesl_a2a.agents.agent_a import AgentA
 from gqesl_a2a.agents.agent_b import AgentB
 from gqesl_a2a.agents.session import bootstrap_session
-from gqesl_a2a.core.crypto import get_session_keys
+from gqesl_a2a.core.concepts import KNOWN_CONCEPTS
 from gqesl_a2a.core.ledger import get_ledger
 from gqesl_a2a.core.semantic_state import cosine_similarity
-from gqesl_a2a.core.tensor_builder import (
-    AgentIntent,
-    EntityType,
-    OutputFormat,
-    TaskType,
-    build_basis_matrix,
-    build_intent_tensor,
-)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +38,7 @@ def run_demo():
     print("=" * 70)
     print()
 
-    # -- Step 1: Bootstrap Session --
+    # step 1
     print("[1] Bootstrapping session...")
     t0 = time.perf_counter()
     info_a, info_b = bootstrap_session()
@@ -56,21 +47,12 @@ def run_demo():
     print(f"    [OK] {get_ledger().concept_count(info_a.session_id)} concepts registered")
     print()
 
-    # -- Step 2: Create Agents --
+    # step 2
     agent_a = AgentA(info_a)
     agent_b = AgentB(info_b)
 
-    # -- Step 3: Demo Scenarios --
-    scenarios = [
-        AgentIntent(TaskType.EXTRACT, EntityType.PERSON, OutputFormat.JSON, 0.9, b"\x01" * 32),
-        AgentIntent(TaskType.SUMMARIZE, EntityType.DOCUMENT, OutputFormat.TEXT, 0.7, b"\x02" * 32),
-        AgentIntent(TaskType.CLASSIFY, EntityType.ORGANIZATION, OutputFormat.TABLE, 0.8, b"\x03" * 32),
-        AgentIntent(TaskType.SEARCH, EntityType.LOCATION, OutputFormat.JSON, 0.5, b"\x04" * 32),
-        AgentIntent(TaskType.GENERATE, EntityType.CODE, OutputFormat.TEXT, 0.95, b"\x05" * 32),
-    ]
-
-    keys = get_session_keys(info_a.session_id)
-    basis = build_basis_matrix(keys.basis_seed)
+    # step 3
+    scenarios = list(KNOWN_CONCEPTS[:5])
 
     print("[2] Running encode -> wire -> decode scenarios:")
     print("-" * 70)
@@ -82,10 +64,10 @@ def run_demo():
     for i, intent in enumerate(scenarios):
         t0 = time.perf_counter()
 
-        # Agent A encodes
+        # encode
         result_a = agent_a.encode_and_sign(intent)
 
-        # Agent B receives and decodes
+        # decode
         result_b = agent_b.verify_and_decode(result_a["packet"])
 
         latency_ms = (time.perf_counter() - t0) * 1000
@@ -95,7 +77,7 @@ def run_demo():
             print(f"    [{i+1}] FAILED -- decode returned None")
             continue
 
-        # Compute cosine similarity
+        # cosine
         original = np.array(result_a["intent_tensor"], dtype=np.float32)
         decoded = np.array(result_b["decoded_tensor"], dtype=np.float32)
         cos_sim = cosine_similarity(original, decoded)
@@ -104,8 +86,8 @@ def run_demo():
         wire_size = len(result_a["wire_bytes"])
         wire_sizes.append(wire_size)
 
-        # Compression ratio (vs hypothetical NL description ~200 chars)
-        nl_size = 200  # Conservative estimate for NL task description
+        # compression
+        nl_size = 200
         compression = nl_size / wire_size if wire_size > 0 else 0
 
         print(f"    [{i+1}] {intent.task_type.name:>10} + {intent.entity_type.name:<12} "
@@ -117,7 +99,7 @@ def run_demo():
 
     print("-" * 70)
 
-    # -- Step 4: Summary Metrics --
+    # step 4
     if cosine_sims:
         print()
         print("[3] Summary Metrics:")
@@ -134,7 +116,7 @@ def run_demo():
         else:
             print("    [WARN] Latency above target")
 
-    # -- Step 5: Drift Check --
+    # step 5
     ledger = get_ledger()
     drifting = ledger.get_drifting_concepts(info_a.session_id)
     print(f"\n[4] Drift: {len(drifting)} concepts drifting out of "

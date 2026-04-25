@@ -17,10 +17,6 @@ from typing import Annotated, Any, Optional
 from typing_extensions import TypedDict
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Custom Reducer for Parallel Branches
-# ═══════════════════════════════════════════════════════════════════════════
-
 def merge_action_results(
     existing: Optional[list[dict]],
     new: Optional[list[dict] | dict],
@@ -39,48 +35,44 @@ def merge_action_results(
     return existing + new
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# GQESLState TypedDict
-# ═══════════════════════════════════════════════════════════════════════════
-
 class GQESLState(TypedDict, total=False):
     """LangGraph state for the GQESL pipeline.
 
     Fields are ``total=False`` so nodes can return partial updates.
     """
 
-    # ── Session Identity ──
+    # session
     session_id: str
-    key_epoch: int               # Current key rotation epoch
-    counter: int                 # Monotonic message counter
+    key_epoch: int               # key epoch
+    counter: int                 # message counter
 
-    # ── Sender Pipeline ──
-    intent: dict                 # AgentIntent serialised as dict (no NL strings)
-    intent_tensor: list[float]   # 384-dim float list
+    # sender
+    intent: dict                 # structured intent
+    intent_tensor: list[float]   # 384-d vector
     projected_tensor: list[float]
-    wire_packet: Optional[dict]  # SemanticMessage as dict — NULLED after verify
+    wire_packet: Optional[dict]  # cleared after verify
 
-    # ── Receiver Pipeline ──
-    decoded_tensor: list[float]  # 384-dim float list
-    rcc8_relation: str           # 2-char relation code: "EQ", "PO", "EC", "DC"
-    strategy: str                # CoordinationStrategy value
-    collapsed_concept: str       # Concept ID from collapse
-    collapsed_similarity: float  # Cosine similarity of collapse
+    # receiver
+    decoded_tensor: list[float]  # 384-d vector
+    rcc8_relation: str           # EQ/PO/EC/DC
+    strategy: str                # coordination mode
+    collapsed_concept: str       # concept id
+    collapsed_similarity: float  # cosine sim
 
-    # ── Action Results (with reducer for parallel branches) ──
+    # action
     action_result: Annotated[list[dict], merge_action_results]
 
-    # ── Error Handling ──
+    # error
     error: Optional[str]
-    error_source: Optional[str]  # Which node produced the error
+    error_source: Optional[str]  # source node
 
-    # ── Task Description (internal, never on wire) ──
-    task_description: str        # Human-readable task for DeepSeek (ephemeral use)
+    # task
+    task_description: str        # local task text
 
-    # ── Peer Public Key (for key exchange) ──
+    # key exchange
     peer_public_key: bytes
     own_public_key: bytes
 
-    # ── Response ──
+    # response
     response_tensor: list[float]
     response_packet: Optional[dict]

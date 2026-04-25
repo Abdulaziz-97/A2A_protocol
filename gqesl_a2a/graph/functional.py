@@ -54,7 +54,7 @@ def functional_encode(
 
     salt = compute_salt(keys.salt_seed, counter)
     ledger = get_ledger()
-    ledger_vecs = ledger.get_all_vectors_matrix(session_id)
+    ledger_vecs = ledger.get_rcc8_ledger_matrix(session_id)
 
     idx, relation, projected = encode_tensor(
         tensor, salt, keys.W1, keys.W2, keys.codebook, ledger_vecs

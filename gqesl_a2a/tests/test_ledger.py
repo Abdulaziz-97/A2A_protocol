@@ -27,7 +27,7 @@ class TestRegisterSearch:
         results = ledger.search(vec, "session_1", k=1)
         assert len(results) == 1
         assert results[0][0] == "test_concept"
-        assert results[0][1] > 0.99  # Same vector → cosine ≈ 1.0
+        assert results[0][1] > 0.99  # same vector
 
     def test_nearest_neighbour(self, ledger):
         v1 = np.zeros(TENSOR_DIM, dtype=np.float32)
@@ -73,13 +73,13 @@ class TestDrift:
         base = np.random.randn(TENSOR_DIM).astype(np.float32)
         ledger.register(base, "c1", "s1")
 
-        # Record varied usage vectors
+        # varied usage
         for i in range(10):
             noisy = base + np.random.randn(TENSOR_DIM).astype(np.float32) * 0.5
             ledger.record_usage("c1", "s1", noisy)
 
         score = ledger.drift_score("c1", "s1")
-        assert score > 0  # Some drift expected
+        assert score > 0  # drift expected
 
     def test_centroid_update(self, ledger):
         base = np.random.randn(TENSOR_DIM).astype(np.float32)
@@ -88,7 +88,7 @@ class TestDrift:
         new_vec = np.random.randn(TENSOR_DIM).astype(np.float32)
         ledger.update_centroid("c1", "s1", new_vec)
 
-        # Search should find the updated vector
+        # find updated
         results = ledger.search(new_vec, "s1")
         assert results[0][1] > 0.99
 
@@ -110,3 +110,12 @@ class TestGetAll:
         mat = ledger.get_all_vectors_matrix("s1")
         assert mat is not None
         assert mat.shape == (5, TENSOR_DIM)
+
+    def test_get_rcc8_ledger_matrix_filters_prefixes(self, ledger):
+        v = np.random.randn(TENSOR_DIM).astype(np.float32)
+        ledger.register(v, "concept_0", "s1")
+        ledger.register(v * 0.9, "warm_EXTRACT_PERSON_JSON", "s1")
+        ledger.register(v * 0.8, "learned_foo_c1", "s1")
+        mat = ledger.get_rcc8_ledger_matrix("s1")
+        assert mat is not None
+        assert mat.shape[0] == 2

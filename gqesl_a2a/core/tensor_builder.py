@@ -25,10 +25,6 @@ from gqesl_a2a.config import BASIS_CONCEPTS, TENSOR_DIM
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Intent Enumerations
-# ═══════════════════════════════════════════════════════════════════════════
-
 class TaskType(IntEnum):
     EXTRACT = 0
     SUMMARIZE = 1
@@ -60,10 +56,6 @@ class OutputFormat(IntEnum):
     GRAPH = 5
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# AgentIntent Dataclass
-# ═══════════════════════════════════════════════════════════════════════════
-
 @dataclass(frozen=True)
 class AgentIntent:
     """Structured representation of an agent's task intent.
@@ -75,9 +67,9 @@ class AgentIntent:
     task_type: TaskType
     entity_type: EntityType
     output_format: OutputFormat
-    priority: float               # 0.0 to 1.0
-    source_ref: bytes             # SHA-256 hash of the data source (32 bytes)
-    debug_label: Optional[str] = None  # local debugging only — never on wire
+    priority: float               # 0..1
+    source_ref: bytes             # 32-byte hash
+    debug_label: Optional[str] = None  # local only
 
 
 class AgentIntentSchema(BaseModel):
@@ -110,10 +102,6 @@ class AgentIntentSchema(BaseModel):
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Basis Matrix Generation
-# ═══════════════════════════════════════════════════════════════════════════
-
 def build_basis_matrix(
     seed: bytes,
     n_concepts: int = BASIS_CONCEPTS,
@@ -138,7 +126,7 @@ def build_basis_matrix(
     Q = Q * signs[np.newaxis, :]
     basis = Q[:n_concepts].astype(np.float32)
 
-    # Verify unit length
+    # unit check
     norms = np.linalg.norm(basis, axis=1)
     assert np.allclose(norms, 1.0, atol=1e-5), "Basis vectors must be unit length"
 
@@ -146,23 +134,14 @@ def build_basis_matrix(
     return basis
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Concept Dimension Mapping
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Each enum value maps to a range of basis vector indices.
-# TaskType   → indices 0–7
-# EntityType → indices 8–15
-# OutputFormat → indices 16–21
-# Priority   → index 22 (continuous weight)
-# SourceRef  → indices 23–54 (one per byte of the 32-byte hash)
+# index map
 
 _TASK_OFFSET = 0
 _ENTITY_OFFSET = len(TaskType)
 _OUTPUT_OFFSET = _ENTITY_OFFSET + len(EntityType)
 _PRIORITY_IDX = _OUTPUT_OFFSET + len(OutputFormat)
 _SOURCE_OFFSET = _PRIORITY_IDX + 1
-_SOURCE_DIMS = 32  # one basis vector per byte of SHA-256 source_ref
+_SOURCE_DIMS = 32  # byte dims
 
 
 def build_intent_tensor(
@@ -182,29 +161,29 @@ def build_intent_tensor(
     """
     tensor = np.zeros(TENSOR_DIM, dtype=np.float32)
 
-    # Task type — strong signal
+    # task
     task_idx = _TASK_OFFSET + int(intent.task_type)
     tensor += 1.0 * basis_matrix[task_idx]
 
-    # Entity type — strong signal
+    # entity
     entity_idx = _ENTITY_OFFSET + int(intent.entity_type)
     tensor += 1.0 * basis_matrix[entity_idx]
 
-    # Output format — moderate signal
+    # format
     output_idx = _OUTPUT_OFFSET + int(intent.output_format)
     tensor += 0.7 * basis_matrix[output_idx]
 
-    # Priority — continuous weight on a dedicated basis vector
+    # priority
     tensor += intent.priority * basis_matrix[_PRIORITY_IDX]
 
-    # Source reference — weak signal distributed across 32 basis vectors
+    # source ref
     for j in range(min(_SOURCE_DIMS, len(intent.source_ref))):
         byte_weight = intent.source_ref[j] / 255.0 * 0.3
         src_idx = _SOURCE_OFFSET + j
         if src_idx < basis_matrix.shape[0]:
             tensor += byte_weight * basis_matrix[src_idx]
 
-    # L2 normalise
+    # normalize
     norm = np.linalg.norm(tensor)
     if norm > 0:
         tensor = tensor / norm
@@ -221,33 +200,33 @@ def collapse_to_intent(
     Returns a dict with the most likely task_type, entity_type, output_format
     by computing cosine similarity against each concept's basis vector.
     """
-    # Normalise input
+    # normalize
     norm = np.linalg.norm(tensor)
     if norm > 0:
         tensor = tensor / norm
 
-    # Task type — argmax over task basis vectors
+    # task argmax
     task_sims = np.array([
         _cosine_sim(tensor, basis_matrix[_TASK_OFFSET + i])
         for i in range(len(TaskType))
     ])
     task_type = TaskType(int(np.argmax(task_sims)))
 
-    # Entity type
+    # entity argmax
     entity_sims = np.array([
         _cosine_sim(tensor, basis_matrix[_ENTITY_OFFSET + i])
         for i in range(len(EntityType))
     ])
     entity_type = EntityType(int(np.argmax(entity_sims)))
 
-    # Output format
+    # format argmax
     output_sims = np.array([
         _cosine_sim(tensor, basis_matrix[_OUTPUT_OFFSET + i])
         for i in range(len(OutputFormat))
     ])
     output_format = OutputFormat(int(np.argmax(output_sims)))
 
-    # Priority — projection onto priority basis vector
+    # priority proj
     priority = float(np.clip(
         _cosine_sim(tensor, basis_matrix[_PRIORITY_IDX]), 0.0, 1.0
     ))

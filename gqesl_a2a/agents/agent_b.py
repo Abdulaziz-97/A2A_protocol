@@ -28,6 +28,7 @@ from gqesl_a2a.core.semantic_state import (
     collapse_tensor,
     compute_rcc8_relation,
     decode_tensor,
+    vector_stats,
 )
 from gqesl_a2a.core.tensor_builder import (
     build_basis_matrix,
@@ -44,11 +45,15 @@ class AgentB:
         self.session_id = session_info.session_id
         self.counter = session_info.counter
 
-    def verify_and_decode(self, packet: dict) -> dict | None:
+    def verify_and_decode(self, packet: dict, *, with_workflow: bool = False) -> dict | None:
         """Verify HMAC, check counter, decode wire packet.
 
         Returns decoded info dict or None on failure.
+        If ``with_workflow`` is True, successful returns include ``workflow`` with
+        receiver-side steps (verify → decode transforms → collapse → strategy).
         """
+        workflow: list[dict] = [] if with_workflow else []
+
         keys = get_session_keys(self.session_id)
 
         v = packet.get("v", 1)
@@ -57,32 +62,71 @@ class AgentB:
         c = packet["c"]
         h = bytes.fromhex(packet["h"])
 
-        # HMAC verification
+        # verify HMAC
         if not verify_packet(keys.hmac_key, v, idx, r, c, h):
             logger.error("HMAC verification FAILED — packet discarded")
             return None
 
-        # Counter freshness
+        if with_workflow:
+            workflow.append({
+                "step": "receiver.hmac_verify",
+                "detail": "HMAC-SHA256 over (v, idx, r, c) matches; packet authentic",
+            })
+
+        # fresh counter
         if c < self.counter:
             logger.error("Counter replay: got %d, expected >= %d", c, self.counter)
             return None
 
-        # Decode
-        salt = compute_salt(keys.salt_seed, c)
-        reconstructed = decode_tensor(idx, keys.codebook, salt, keys.W1, keys.W2)
+        if with_workflow:
+            workflow.append({
+                "step": "receiver.counter_fresh",
+                "detail": f"c={c} >= local counter {self.counter} (anti-replay)",
+            })
 
-        # Collapse
+        # decode
+        salt = compute_salt(keys.salt_seed, c)
+        if with_workflow:
+            workflow.append({
+                "step": "receiver.salt",
+                "detail": f"same HKDF salt as sender for c={c}",
+                "tensor_stats": vector_stats(salt),
+            })
+
+        decode_trace = workflow if with_workflow else None
+        reconstructed = decode_tensor(
+            idx, keys.codebook, salt, keys.W1, keys.W2, trace=decode_trace
+        )
+
+        # collapse
         basis = build_basis_matrix(keys.basis_seed)
         concept_idx, similarity = collapse_tensor(reconstructed, basis)
 
-        # Record usage for drift
+        if with_workflow:
+            workflow.append({
+                "step": "receiver.collapse",
+                "detail": f"argmax cosine vs basis -> concept_{concept_idx}, sim={similarity:.4f}",
+                "tensor_stats": vector_stats(reconstructed),
+            })
+
+        # track drift
         ledger = get_ledger()
         concept_id = f"concept_{concept_idx}"
         ledger.record_usage(concept_id, self.session_id, reconstructed)
 
-        # Strategy
+        # strategy
         relation = RCC8Relation(r)
         strategy = RCC8_STRATEGY_MAP[relation]
+
+        if with_workflow:
+            workflow.append({
+                "step": "receiver.rcc8_strategy",
+                "detail": f"wire relation {relation.value} -> coordination {strategy.value}",
+            })
+            workflow.append({
+                "step": "receiver.counter_advance",
+                "detail": f"local counter set to c+1 = {c + 1}",
+            })
 
         self.counter = c + 1
 
@@ -91,7 +135,7 @@ class AgentB:
             concept_id, similarity, relation.value, strategy.value,
         )
 
-        return {
+        out: dict = {
             "decoded_tensor": reconstructed.tolist(),
             "concept_id": concept_id,
             "concept_idx": concept_idx,
@@ -99,6 +143,9 @@ class AgentB:
             "relation": relation.value,
             "strategy": strategy.value,
         }
+        if with_workflow:
+            out["workflow"] = workflow
+        return out
 
     def execute_task(self, decode_result: dict) -> dict:
         """Execute the decoded task using DeepSeek (ephemeral).
@@ -111,7 +158,7 @@ class AgentB:
         decoded = np.array(decode_result["decoded_tensor"], dtype=np.float32)
         intent_info = collapse_to_intent(decoded, basis)
 
-        # --- DeepSeek call (ephemeral) ---
+        # local LLM
         try:
             from langchain_openai import ChatOpenAI
             llm = ChatOpenAI(
@@ -126,7 +173,7 @@ class AgentB:
                 f"output_format={intent_info['output_format'].name}. "
                 f"Provide a brief structured result."
             )
-            response = llm.invoke(prompt)  # Ephemeral — discarded
+            response = llm.invoke(prompt)  # local only
             execution_status = "completed"
         except Exception as e:
             logger.warning("DeepSeek execution failed: %s", e)

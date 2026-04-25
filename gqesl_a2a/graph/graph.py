@@ -41,10 +41,6 @@ from gqesl_a2a.graph.state import GQESLState
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Conditional Edge Functions
-# ═══════════════════════════════════════════════════════════════════════════
-
 def _route_rcc8(state: GQESLState) -> str:
     """Route based on RCC-8 relation to the appropriate strategy node."""
     strategy = state.get("strategy", "NEGOTIATE_FIRST")
@@ -89,15 +85,11 @@ def _check_negotiate_result(state: GQESLState) -> str:
     return "collapse"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Sender Graph
-# ═══════════════════════════════════════════════════════════════════════════
-
 def build_sender_graph() -> StateGraph:
     """Build the sender-side graph: intent → encode → sign → transmit."""
     graph = StateGraph(GQESLState)
 
-    # Add nodes
+    # nodes
     graph.add_node("key_exchange", key_exchange_node)
     graph.add_node("build_intent", build_intent_node)
     graph.add_node("encode", encode_node)
@@ -105,7 +97,7 @@ def build_sender_graph() -> StateGraph:
     graph.add_node("session_terminate", session_terminate_node)
     graph.add_node("error_handler", error_handler_node)
 
-    # Edges
+    # edges
     graph.set_entry_point("key_exchange")
     graph.add_edge("key_exchange", "build_intent")
     graph.add_edge("build_intent", "encode")
@@ -120,15 +112,11 @@ def build_sender_graph() -> StateGraph:
     return graph
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Receiver Graph
-# ═══════════════════════════════════════════════════════════════════════════
-
 def build_receiver_graph() -> StateGraph:
     """Build the receiver-side graph: verify → decode → route → execute → respond."""
     graph = StateGraph(GQESLState)
 
-    # Add nodes
+    # nodes
     graph.add_node("verify", verify_node)
     graph.add_node("decode", decode_node)
     graph.add_node("rcc8_route", rcc8_route_node)
@@ -144,19 +132,19 @@ def build_receiver_graph() -> StateGraph:
     graph.add_node("counter_sync", counter_sync_node)
     graph.add_node("session_terminate", session_terminate_node)
 
-    # Entry
+    # entry
     graph.set_entry_point("verify")
 
-    # Verify → decode or error
+    # verify route
     graph.add_conditional_edges("verify", _check_verify_result, {
         "decode": "decode",
         "error_handler": "error_handler",
     })
 
-    # Decode → RCC-8 routing
+    # decode route
     graph.add_edge("decode", "rcc8_route")
 
-    # RCC-8 routing → strategy nodes
+    # rcc8 route
     graph.add_conditional_edges("rcc8_route", _route_rcc8, {
         "exact_dispatch": "exact_dispatch",
         "parallel_split": "parallel_split",
@@ -164,7 +152,7 @@ def build_receiver_graph() -> StateGraph:
         "negotiate": "negotiate",
     })
 
-    # Strategy nodes → collapse
+    # strategy route
     graph.add_edge("exact_dispatch", "collapse")
     graph.add_edge("parallel_split", "collapse")
     graph.add_edge("handoff", "collapse")
@@ -173,28 +161,24 @@ def build_receiver_graph() -> StateGraph:
         "error_handler": "error_handler",
     })
 
-    # Collapse → drift check or execute (Fix #4)
+    # collapse route
     graph.add_conditional_edges("collapse", _should_check_drift, {
         "drift_monitor": "drift_monitor",
         "execute": "execute",
     })
     graph.add_edge("drift_monitor", "execute")
 
-    # Execute → respond
+    # execute route
     graph.add_edge("execute", "respond")
     graph.add_edge("respond", END)
 
-    # Error handler → end
+    # error route
     graph.add_edge("error_handler", END)
     graph.add_edge("session_terminate", END)
     graph.add_edge("counter_sync", "verify")
 
     return graph
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Compiled Graphs
-# ═══════════════════════════════════════════════════════════════════════════
 
 def compile_sender_graph(checkpointer=None):
     """Compile the sender graph with optional checkpointer."""

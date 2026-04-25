@@ -17,8 +17,9 @@ CRITICAL DESIGN DECISIONS:
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from pydantic import BaseModel, field_validator
@@ -34,10 +35,6 @@ from gqesl_a2a.config import (
 
 logger = logging.getLogger(__name__)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Wire Packet Model
-# ═══════════════════════════════════════════════════════════════════════════
 
 class SemanticMessage(BaseModel):
     """The ~41-byte wire packet.
@@ -95,10 +92,6 @@ def unpack_packet(data: bytes) -> SemanticMessage:
     return SemanticMessage(v=v, idx=idx, r=r, c=c, h=h)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# RCC-8 Relation & Coordination Strategy
-# ═══════════════════════════════════════════════════════════════════════════
-
 class RCC8Relation(str, Enum):
     EQ = "EQ"
     PO = "PO"
@@ -137,10 +130,6 @@ def compute_rcc8_relation(
         return RCC8Relation.DC
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Cosine Utilities
-# ═══════════════════════════════════════════════════════════════════════════
-
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     a = a.astype(np.float64)
     b = b.astype(np.float64)
@@ -152,6 +141,21 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return dot / (na * nb)
 
 
+def vector_stats(arr: np.ndarray) -> dict[str, Any]:
+    """Compact summary for dashboards (JSON-serialisable)."""
+    a = np.asarray(arr, dtype=np.float64)
+    flat = a.ravel()
+    if flat.size == 0:
+        return {"shape": [], "norm": 0.0, "min": 0.0, "max": 0.0, "mean": 0.0}
+    return {
+        "shape": list(a.shape),
+        "norm": float(np.linalg.norm(flat)),
+        "min": float(np.min(flat)),
+        "max": float(np.max(flat)),
+        "mean": float(np.mean(flat)),
+    }
+
+
 def cosine_distance_matrix(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     q = query.astype(np.float64)
     m = matrix.astype(np.float64)
@@ -160,10 +164,6 @@ def cosine_distance_matrix(query: np.ndarray, matrix: np.ndarray) -> np.ndarray:
     return mat_norms @ query_norm
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Encode Pipeline
-# ═══════════════════════════════════════════════════════════════════════════
-
 def encode_tensor(
     intent_tensor: np.ndarray,
     salt: np.ndarray,
@@ -171,44 +171,86 @@ def encode_tensor(
     W2: np.ndarray,
     codebook: np.ndarray,
     ledger_vectors: Optional[np.ndarray] = None,
+    trace: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[int, RCC8Relation, np.ndarray]:
     """Full encode pipeline: normalise → salt → project → RCC-8 → quantise.
 
     All operations in float64 for numerical stability.
+
+    If ``trace`` is a list, each transformation appends a dict:
+    ``{"step", "detail", "tensor_stats"?}`` for UI / debugging.
     """
-    # Upcast to float64
+    # fp64 math
     t = intent_tensor.astype(np.float64)
     s = salt.astype(np.float64)
     w1 = W1.astype(np.float64)
     w2 = W2.astype(np.float64)
     cb = codebook.astype(np.float64)
 
-    # 1. Normalise to [-0.5, 0.5] range to prevent tanh saturation
+    if trace is not None:
+        trace.append({
+            "step": "encode.input",
+            "detail": "Intent tensor (384-d) before normalise",
+            "tensor_stats": vector_stats(t),
+        })
+
+    # normalize
     norm = np.linalg.norm(t)
     if norm > 0:
         normalised = t / norm * 0.5
     else:
         normalised = t.copy()
 
-    # 2. Salt injection
+    if trace is not None:
+        trace.append({
+            "step": "encode.normalise",
+            "detail": f"L2 norm before={norm:.6f}; scale to max half-radius 0.5",
+            "tensor_stats": vector_stats(normalised),
+        })
+
+    # add salt
     salted = normalised + s
 
-    # 3. Non-linear projection: tanh(salted @ W1) @ W2
+    if trace is not None:
+        trace.append({
+            "step": "encode.salt_inject",
+            "detail": "Add per-message salt (HKDF-derived, same length as tensor)",
+            "tensor_stats": vector_stats(salted),
+        })
+
+    # project
     intermediate = np.tanh(salted @ w1)
     projected = intermediate @ w2
 
-    # 4. RCC-8 relation against semantic ledger
+    if trace is not None:
+        trace.append({
+            "step": "encode.project_tanh",
+            "detail": "intermediate = tanh(salted @ W1); projected = intermediate @ W2",
+            "tensor_stats": vector_stats(intermediate),
+            "secondary_stats": vector_stats(projected),
+        })
+
+    # RCC-8 check
     if ledger_vectors is not None and ledger_vectors.shape[0] > 0:
         lv = ledger_vectors.astype(np.float64)
-        similarities = cosine_distance_matrix(projected.astype(np.float32), lv.astype(np.float32))
+        similarities = cosine_distance_matrix(
+            normalised.astype(np.float32), lv.astype(np.float32)
+        )
         max_sim = float(np.max(similarities))
         relation = compute_rcc8_relation(max_sim)
+        rcc_detail = f"max cosine vs vocabulary={max_sim:.4f} -> relation {relation.value}"
     else:
         relation = RCC8Relation.DC
+        rcc_detail = "empty ledger -> default DC (disconnected)"
 
-    # 5. Codebook quantisation — L2 distance (not cosine)
-    # Random vectors in 384-D have near-zero cosine similarity,
-    # so L2 gives much better nearest-neighbour results.
+    if trace is not None:
+        trace.append({
+            "step": "encode.rcc8_ledger",
+            "detail": rcc_detail,
+            "ledger_rows": int(ledger_vectors.shape[0]) if ledger_vectors is not None else 0,
+        })
+
+    # L2 quantize
     diffs = cb - projected[np.newaxis, :]
     l2_dists = np.linalg.norm(diffs, axis=1)
     idx = int(np.argmin(l2_dists))
@@ -217,12 +259,16 @@ def encode_tensor(
     if quant_error > 5.0:
         logger.warning("High quantisation L2 error (%.3f)", quant_error)
 
+    if trace is not None:
+        trace.append({
+            "step": "encode.quantize_l2",
+            "detail": f"codebook index={idx}, L2 quantisation error={quant_error:.4f}",
+            "codebook_idx": idx,
+            "quant_error_l2": quant_error,
+        })
+
     return idx, relation, projected.astype(np.float32)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Decode Pipeline  (Fix #1: uses W.T, not pseudo-inverse)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def decode_tensor(
     idx: int,
@@ -230,51 +276,180 @@ def decode_tensor(
     salt: np.ndarray,
     W1: np.ndarray,
     W2: np.ndarray,
+    trace: Optional[list[dict[str, Any]]] = None,
 ) -> np.ndarray:
     """Full decode pipeline: codebook lookup → reverse W2 → arctanh → reverse W1 → desalt.
 
     Because W1 and W2 are orthogonal (QR), their inverse is their transpose.
     All operations in float64 for stability.
+
+    If ``trace`` is a list, append one dict per transformation (for UI).
     """
     cb = codebook.astype(np.float64)
     s = salt.astype(np.float64)
     w1 = W1.astype(np.float64)
     w2 = W2.astype(np.float64)
 
-    # 1. Codebook lookup
+    # lookup
     cb_vec = cb[idx].copy()
 
-    # 2. Reverse W2: projected = intermediate @ W2 → intermediate = projected @ W2.T
+    if trace is not None:
+        trace.append({
+            "step": "decode.codebook_lookup",
+            "detail": f"idx={idx} -> 384-d codebook vector",
+            "tensor_stats": vector_stats(cb_vec),
+        })
+
+    # reverse W2
     intermediate = cb_vec @ w2.T
 
-    # 3. Inverse tanh with safe clipping
+    if trace is not None:
+        trace.append({
+            "step": "decode.reverse_W2",
+            "detail": "intermediate = codebook_vec @ W2.T",
+            "tensor_stats": vector_stats(intermediate),
+        })
+
+    # arctanh
     clipped = np.clip(intermediate, -ARCTANH_CLIP, ARCTANH_CLIP)
     pre_tanh = np.arctanh(clipped)
-    
-    # 3.5. L2 normalise after arctanh to prevent scale explosion (Item 8)
+
+    if trace is not None:
+        trace.append({
+            "step": "decode.arctanh",
+            "detail": f"clip to +/-{ARCTANH_CLIP} then arctanh",
+            "tensor_stats": vector_stats(pre_tanh),
+        })
+
+    # re-normalize
     pt_norm = np.linalg.norm(pre_tanh)
     if pt_norm > 0:
         pre_tanh = pre_tanh / pt_norm * 0.5
 
-    # 4. Reverse W1: pre_tanh = salted @ W1 → salted = pre_tanh @ W1.T
+    if trace is not None:
+        trace.append({
+            "step": "decode.post_arctanh_norm",
+            "detail": "L2 normalise to half-radius 0.5 (stability)",
+            "tensor_stats": vector_stats(pre_tanh),
+        })
+
+    # reverse W1
     salted = pre_tanh @ w1.T
 
-    # 5. Remove salt
+    if trace is not None:
+        trace.append({
+            "step": "decode.reverse_W1",
+            "detail": "salted = pre_tanh @ W1.T",
+            "tensor_stats": vector_stats(salted),
+        })
+
+    # remove salt
     normalised = salted - s
 
-    # 6. Rescale back to unit vector
+    if trace is not None:
+        trace.append({
+            "step": "decode.desalt",
+            "detail": "normalised = salted − salt",
+            "tensor_stats": vector_stats(normalised),
+        })
+
+    # unit scale
     norm = np.linalg.norm(normalised)
     if norm > 0:
         reconstructed = normalised / norm
     else:
         reconstructed = normalised
 
+    if trace is not None:
+        trace.append({
+            "step": "decode.unit_rescale",
+            "detail": f"L2 norm before rescale={norm:.6f} -> unit intent direction",
+            "tensor_stats": vector_stats(reconstructed),
+        })
+
     return reconstructed.astype(np.float32)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Collapse
-# ═══════════════════════════════════════════════════════════════════════════
+def encode_pipeline_vector_stages(
+    intent_tensor: np.ndarray,
+    salt: np.ndarray,
+    W1: np.ndarray,
+    W2: np.ndarray,
+    codebook: np.ndarray,
+) -> tuple[OrderedDict[str, np.ndarray], int]:
+    """Ordered 384-d snapshots after each encode transform (for docs / markdown).
+
+    Mirrors ``encode_tensor`` geometry through quantisation. Does not run RCC-8.
+    """
+    t = intent_tensor.astype(np.float64)
+    s = salt.astype(np.float64)
+    w1 = W1.astype(np.float64)
+    w2 = W2.astype(np.float64)
+    cb = codebook.astype(np.float64)
+
+    out: OrderedDict[str, np.ndarray] = OrderedDict()
+    out["01_raw_intent"] = t.astype(np.float32)
+
+    norm = np.linalg.norm(t)
+    normalised = (t / norm * 0.5) if norm > 0 else t.copy()
+    out["02_normalised_half_radius"] = normalised.astype(np.float32)
+
+    salted = normalised + s
+    out["03_plus_salt"] = salted.astype(np.float32)
+
+    intermediate = np.tanh(salted @ w1)
+    projected = intermediate @ w2
+    out["04_tanh_W1_hidden"] = intermediate.astype(np.float32)
+    out["05_W2_projected"] = projected.astype(np.float32)
+
+    diffs = cb - projected[np.newaxis, :]
+    idx = int(np.argmin(np.linalg.norm(diffs, axis=1)))
+    out["06_codebook_row_idx"] = cb[idx].astype(np.float32)
+
+    return out, idx
+
+
+def decode_pipeline_vector_stages(
+    idx: int,
+    codebook: np.ndarray,
+    salt: np.ndarray,
+    W1: np.ndarray,
+    W2: np.ndarray,
+) -> OrderedDict[str, np.ndarray]:
+    """Ordered 384-d snapshots for each decode step (for docs / markdown)."""
+    cb = codebook.astype(np.float64)
+    s = salt.astype(np.float64)
+    w1 = W1.astype(np.float64)
+    w2 = W2.astype(np.float64)
+
+    out: OrderedDict[str, np.ndarray] = OrderedDict()
+    cb_vec = cb[idx].copy()
+    out["01_codebook_row"] = cb_vec.astype(np.float32)
+
+    intermediate = cb_vec @ w2.T
+    out["02_reverse_W2"] = intermediate.astype(np.float32)
+
+    clipped = np.clip(intermediate, -ARCTANH_CLIP, ARCTANH_CLIP)
+    pre_tanh = np.arctanh(clipped)
+    out["03_arctanh"] = pre_tanh.astype(np.float32)
+
+    pt_norm = np.linalg.norm(pre_tanh)
+    if pt_norm > 0:
+        pre_tanh = pre_tanh / pt_norm * 0.5
+    out["04_post_arctanh_norm"] = pre_tanh.astype(np.float32)
+
+    salted = pre_tanh @ w1.T
+    out["05_reverse_W1_salted"] = salted.astype(np.float32)
+
+    normalised = salted - s
+    out["06_desalted"] = normalised.astype(np.float32)
+
+    n2 = np.linalg.norm(normalised)
+    reconstructed = (normalised / n2) if n2 > 0 else normalised
+    out["07_unit_intent"] = reconstructed.astype(np.float32)
+
+    return out
+
 
 def collapse_tensor(
     tensor: np.ndarray,

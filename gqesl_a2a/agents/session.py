@@ -35,16 +35,13 @@ from gqesl_a2a.core.crypto import (
     sign_packet,
     verify_packet,
 )
-from gqesl_a2a.core.ledger import SemanticLedger, get_ledger
+from gqesl_a2a.core.concepts import KNOWN_CONCEPTS
+from gqesl_a2a.core.ledger import SemanticLedger, get_ledger, warm_ledger
 from gqesl_a2a.core.semantic_state import SemanticMessage
 from gqesl_a2a.core.tensor_builder import build_basis_matrix
 
 logger = logging.getLogger(__name__)
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MessageBus — Transport Abstraction (Issue #15)
-# ═══════════════════════════════════════════════════════════════════════════
 
 class MessageBus(ABC):
     """Abstract transport layer between agents."""
@@ -93,10 +90,6 @@ class InProcessBusView(MessageBus):
         return await self._recv_q.get()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Synchronous MessageBus for non-async contexts
-# ═══════════════════════════════════════════════════════════════════════════
-
 class SyncInProcessBus:
     """Synchronous in-memory bus for testing without async."""
 
@@ -116,10 +109,6 @@ class SyncInProcessBus:
     def receive_at_a(self) -> bytes | None:
         return self._b_to_a.pop(0) if self._b_to_a else None
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Session Bootstrap Protocol
-# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class SessionInfo:
@@ -149,46 +138,52 @@ def bootstrap_session() -> tuple[SessionInfo, SessionInfo]:
     session_id = str(uuid.uuid4())
     session_nonce = os.urandom(16)
 
-    # Step 1: Generate keypairs
+    # step 1
     priv_a, pub_a = generate_keypair()
     priv_b, pub_b = generate_keypair()
 
-    # Step 2-3: Compute shared secrets (must be identical)
+    # step 2-3
     secret_a = compute_shared_secret(priv_a, pub_b)
     secret_b = compute_shared_secret(priv_b, pub_a)
     assert secret_a == secret_b, "ECDH shared secrets do not match!"
 
-    # Step 4: Derive session keys
+    # step 4
     keys_a = derive_session_keys(secret_a, session_nonce, epoch=0)
     keys_b = derive_session_keys(secret_b, session_nonce, epoch=0)
 
-    # Verify keys match
+    # check keys
     assert np.allclose(keys_a.W1, keys_b.W1), "W1 mismatch!"
     assert np.allclose(keys_a.W2, keys_b.W2), "W2 mismatch!"
     assert np.allclose(keys_a.codebook, keys_b.codebook), "Codebook mismatch!"
     assert keys_a.hmac_key == keys_b.hmac_key, "HMAC key mismatch!"
 
-    # Step 5: Warm up codebook with projected basis vectors
+    # step 5
     basis = build_basis_matrix(keys_a.basis_seed)
     warmed_codebook = warm_codebook(keys_a.codebook, basis, keys_a.W1, keys_a.W2)
     keys_a.codebook = warmed_codebook
-    keys_b.codebook = warmed_codebook  # Both agents must have identical codebook
+    keys_b.codebook = warmed_codebook  # same codebook
 
-    # Register keys in the module-level registry
+    # register keys
     register_session_keys(session_id, keys_a)
 
-    # Step 6: Register basis concepts
+    # step 6
     ledger = get_ledger()
     for i in range(min(basis.shape[0], 55)):
         ledger.register(basis[i], f"concept_{i}", session_id)
 
-    # 6. Test Handshake
+    warmed = warm_ledger(ledger, session_id, keys_a.basis_seed, KNOWN_CONCEPTS)
+    logger.info("Ledger warmed with %d shared concepts (RCC-8 vocabulary)", warmed)
+
+    # handshake
     test_hmac = sign_packet(keys_a.hmac_key, 1, 0, "EQ", 0)
     assert verify_packet(keys_b.hmac_key, 1, 0, "EQ", 0, test_hmac), \
         "Handshake verification failed!"
 
-    logger.info("Session %s bootstrapped successfully (%d concepts, codebook warmed)",
-                session_id, ledger.concept_count(session_id))
+    logger.info(
+        "Session %s bootstrapped successfully (%d ledger rows, codebook warmed)",
+        session_id,
+        ledger.concept_count(session_id),
+    )
 
     info_a = SessionInfo(session_id=session_id, is_ready=True)
     info_b = SessionInfo(session_id=session_id, is_ready=True)

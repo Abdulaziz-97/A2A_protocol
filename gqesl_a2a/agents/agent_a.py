@@ -28,6 +28,7 @@ from gqesl_a2a.core.semantic_state import (
     SemanticMessage,
     encode_tensor,
     pack_packet,
+    vector_stats,
 )
 from gqesl_a2a.core.tensor_builder import (
     AgentIntent,
@@ -73,7 +74,7 @@ class AgentA:
                 f"Task: {task_description}"
             )
 
-            response = llm.invoke(prompt)  # Ephemeral — local var only
+            response = llm.invoke(prompt)  # local only
             content = response.content.strip()
             if "```" in content:
                 content = content.split("```")[1]
@@ -99,30 +100,64 @@ class AgentA:
                 source_ref=os.urandom(32),
             )
 
-    def encode_and_sign(self, intent: AgentIntent) -> dict:
+    def encode_and_sign(self, intent: AgentIntent, *, with_workflow: bool = False) -> dict:
         """Encode an intent into a signed wire packet.
 
         Returns the packet dict ready for transmission.
+        If ``with_workflow`` is True, includes ``workflow`` — ordered sender-side
+        steps with tensor summaries for dashboards.
         """
+        workflow: list[dict] = [] if with_workflow else []
+
         keys = get_session_keys(self.session_id)
 
-        # Check rotation
+        # rotate?
         if should_rotate(self.counter, keys.epoch):
             keys = rotate_keys(self.session_id)
+            if with_workflow:
+                workflow.append({
+                    "step": "sender.key_rotation",
+                    "detail": "HKDF epoch advanced (counter vs epoch policy)",
+                })
 
-        # Check termination
+        # terminate?
         if should_terminate_session(self.counter):
             raise RuntimeError("Session max messages reached — must re-bootstrap")
 
         basis = build_basis_matrix(keys.basis_seed)
+        if with_workflow:
+            workflow.append({
+                "step": "sender.basis_matrix",
+                "detail": "384xN concept basis from HKDF basis_seed (session-private)",
+                "tensor_stats": vector_stats(basis),
+            })
+
         tensor = build_intent_tensor(intent, basis)
+        if with_workflow:
+            workflow.append({
+                "step": "sender.intent_tensor",
+                "detail": (
+                    f"weighted superposition: task={intent.task_type.name}, "
+                    f"entity={intent.entity_type.name}, format={intent.output_format.name}, "
+                    f"priority={intent.priority:.3f}"
+                ),
+                "tensor_stats": vector_stats(tensor),
+            })
+
         salt = compute_salt(keys.salt_seed, self.counter)
+        if with_workflow:
+            workflow.append({
+                "step": "sender.salt",
+                "detail": f"HKDF salt for counter c={self.counter}",
+                "tensor_stats": vector_stats(salt),
+            })
 
         ledger = get_ledger()
-        ledger_vecs = ledger.get_all_vectors_matrix(self.session_id)
+        ledger_vecs = ledger.get_rcc8_ledger_matrix(self.session_id)
 
+        encode_trace = workflow if with_workflow else None
         idx, relation, projected = encode_tensor(
-            tensor, salt, keys.W1, keys.W2, keys.codebook, ledger_vecs
+            tensor, salt, keys.W1, keys.W2, keys.codebook, ledger_vecs, trace=encode_trace
         )
 
         v = 1
@@ -141,6 +176,17 @@ class AgentA:
         )
         wire_bytes = pack_packet(wire_msg)
 
+        if with_workflow:
+            workflow.append({
+                "step": "sender.hmac_sign",
+                "detail": f"HMAC-SHA256 over (v, idx, r, c); digest {len(hmac_digest)} B",
+            })
+            workflow.append({
+                "step": "sender.wire_pack",
+                "detail": f"SemanticMessage packed -> {len(wire_bytes)} B on wire",
+                "wire_bytes": len(wire_bytes),
+            })
+
         self.counter += 1
 
         logger.info(
@@ -148,12 +194,15 @@ class AgentA:
             idx, relation.value, self.counter - 1, len(wire_bytes),
         )
 
-        return {
+        out: dict = {
             "packet": packet,
             "wire_bytes": wire_bytes,
             "intent_tensor": tensor.tolist(),
             "relation": relation.value,
         }
+        if with_workflow:
+            out["workflow"] = workflow
+        return out
 
     def send_task(self, task_description: str) -> dict:
         """Full pipeline: parse task → build intent → encode → sign."""

@@ -18,6 +18,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
 from gqesl_a2a import config
+from gqesl_a2a.core.concepts import KNOWN_CONCEPTS
 from gqesl_a2a.core.crypto import (
     clear_session_keys,
     compute_salt,
@@ -31,8 +32,9 @@ from gqesl_a2a.core.crypto import (
     should_terminate_session,
     sign_packet,
     verify_packet,
+    warm_codebook,
 )
-from gqesl_a2a.core.ledger import get_ledger
+from gqesl_a2a.core.ledger import get_ledger, warm_ledger
 from gqesl_a2a.core.semantic_state import (
     CoordinationStrategy,
     RCC8Relation,
@@ -57,10 +59,6 @@ from gqesl_a2a.graph.state import GQESLState
 logger = logging.getLogger(__name__)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# DeepSeek LLM (ephemeral — never stored in state)
-# ═══════════════════════════════════════════════════════════════════════════
-
 def _get_llm() -> ChatOpenAI:
     return ChatOpenAI(
         model=config.DEEPSEEK_MODEL,
@@ -70,19 +68,11 @@ def _get_llm() -> ChatOpenAI:
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Negotiation Resume Model (Fix #6)
-# ═══════════════════════════════════════════════════════════════════════════
-
 class NegotiationResume(BaseModel):
     action: Literal["accept", "counter", "reject"]
     counter_proposal_tensor: Optional[list[float]] = None
     accept: bool = False
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: key_exchange_node
-# ═══════════════════════════════════════════════════════════════════════════
 
 def key_exchange_node(state: GQESLState) -> dict:
     """Run ECDH handshake and derive all session keys."""
@@ -90,7 +80,7 @@ def key_exchange_node(state: GQESLState) -> dict:
     peer_pub = state.get("peer_public_key")
 
     if peer_pub is None:
-        # First agent — generate keypair, wait for peer
+        # first peer
         session_id = str(uuid.uuid4())
         return {
             "session_id": session_id,
@@ -99,22 +89,28 @@ def key_exchange_node(state: GQESLState) -> dict:
             "key_epoch": 0,
         }
 
-    # Second agent or both keys available — compute shared secret
+    # shared secret
     session_id = state.get("session_id", str(uuid.uuid4()))
     shared_secret = compute_shared_secret(private_key, peer_pub)
     session_nonce = os.urandom(16)
 
     keys = derive_session_keys(shared_secret, session_nonce, epoch=0)
+    basis = build_basis_matrix(keys.basis_seed)
+    keys.codebook = warm_codebook(keys.codebook, basis, keys.W1, keys.W2)
     register_session_keys(session_id, keys)
 
-    # Register basis concepts in ledger (session bootstrap)
+    # warm ledger
     ledger = get_ledger()
-    basis = build_basis_matrix(keys.basis_seed)
-    for i in range(min(basis.shape[0], 55)):  # Register first 55 concepts
+    for i in range(min(basis.shape[0], 55)):  # first 55
         ledger.register(basis[i], f"concept_{i}", session_id)
 
-    logger.info("Session %s: key exchange complete, %d concepts registered",
-                session_id, ledger.concept_count(session_id))
+    warmed = warm_ledger(ledger, session_id, keys.basis_seed, KNOWN_CONCEPTS)
+    logger.info(
+        "Session %s: key exchange complete, %d ledger rows (%d warmed vocabulary)",
+        session_id,
+        ledger.concept_count(session_id),
+        warmed,
+    )
 
     return {
         "session_id": session_id,
@@ -124,17 +120,13 @@ def key_exchange_node(state: GQESLState) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: build_intent_node  (Fix #2: DeepSeek output is ephemeral)
-# ═══════════════════════════════════════════════════════════════════════════
-
 def build_intent_node(state: GQESLState) -> dict:
     """Use DeepSeek (locally) to reason about the task, then build tensor."""
     session_id = state["session_id"]
     keys = get_session_keys(session_id)
     task_desc = state.get("task_description", "")
 
-    # --- DeepSeek call in LOCAL SCOPE — NL never enters state ---
+    # local LLM
     if task_desc:
         import json
         import time
@@ -151,7 +143,7 @@ def build_intent_node(state: GQESLState) -> dict:
         parsed = None
         for attempt in range(config.DEEPSEEK_MAX_RETRIES):
             try:
-                response = llm.invoke(prompt)  # Local var — discarded after parsing
+                response = llm.invoke(prompt)  # local only
                 content = response.content.strip()
                 if "```" in content:
                     content = content.split("```")[1]
@@ -176,7 +168,7 @@ def build_intent_node(state: GQESLState) -> dict:
             output_format = OutputFormat.JSON
             priority = 0.5
     else:
-        # Use intent from state if provided
+        # state intent
         intent_dict = state.get("intent", {})
         task_type = TaskType[intent_dict.get("task_type", "EXTRACT")]
         entity_type = EntityType[intent_dict.get("entity_type", "DATA")]
@@ -205,27 +197,24 @@ def build_intent_node(state: GQESLState) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: encode_node  (checks rotation + termination)
-# ═══════════════════════════════════════════════════════════════════════════
-
 def encode_node(state: GQESLState) -> dict:
     """Salt → project → quantise → RCC-8."""
     session_id = state["session_id"]
     counter = state.get("counter", 0)
 
-    # Check session termination
+    # terminate?
     if should_terminate_session(counter):
-        # Generate the termination packet (idx=4095)
+        # end packet
+        keys_term = get_session_keys(session_id)
         logger.info("Session max messages reached. Sending termination packet.")
         return {
             "projected_tensor": np.zeros(384, dtype=np.float32).tolist(),
             "rcc8_relation": "DC",
-            "key_epoch": keys.epoch,
+            "key_epoch": keys_term.epoch,
             "_is_termination_packet": True,
         }
 
-    # Check key rotation
+    # rotate?
     keys = get_session_keys(session_id)
     if should_rotate(counter, keys.epoch):
         keys = rotate_keys(session_id)
@@ -235,7 +224,7 @@ def encode_node(state: GQESLState) -> dict:
     salt = compute_salt(keys.salt_seed, counter)
 
     ledger = get_ledger()
-    ledger_vecs = ledger.get_all_vectors_matrix(session_id)
+    ledger_vecs = ledger.get_rcc8_ledger_matrix(session_id)
 
     idx, relation, projected = encode_tensor(
         intent_tensor, salt, keys.W1, keys.W2, keys.codebook, ledger_vecs
@@ -248,10 +237,6 @@ def encode_node(state: GQESLState) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: sign_node
-# ═══════════════════════════════════════════════════════════════════════════
-
 def sign_node(state: GQESLState) -> dict:
     """HMAC sign the wire packet."""
     session_id = state["session_id"]
@@ -261,7 +246,7 @@ def sign_node(state: GQESLState) -> dict:
     intent_tensor = np.array(state["intent_tensor"], dtype=np.float32)
     salt = compute_salt(keys.salt_seed, counter)
     ledger = get_ledger()
-    ledger_vecs = ledger.get_all_vectors_matrix(session_id)
+    ledger_vecs = ledger.get_rcc8_ledger_matrix(session_id)
 
     is_term = state.get("_is_termination_packet", False)
     if is_term:
@@ -288,10 +273,6 @@ def sign_node(state: GQESLState) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: verify_node  (Fix #9: nulls wire_packet after success)
-# ═══════════════════════════════════════════════════════════════════════════
-
 def verify_node(state: GQESLState) -> dict:
     """Verify HMAC and counter freshness.  Nulls wire_packet on success."""
     session_id = state["session_id"]
@@ -307,7 +288,7 @@ def verify_node(state: GQESLState) -> dict:
     c = packet_dict["c"]
     h = bytes.fromhex(packet_dict["h"])
 
-    # HMAC verification
+    # verify HMAC
     if not verify_packet(keys.hmac_key, v, idx, r, c, h):
         logger.error("HMAC verification FAILED for counter %d", c)
         return {
@@ -316,9 +297,9 @@ def verify_node(state: GQESLState) -> dict:
             "wire_packet": None,
         }
 
-    # Counter freshness (must be >= current counter)
+    # fresh counter
     current_counter = state.get("counter", 0)
-    # Check teardown buffer (Item 2)
+    # buffer limit
     if c > config.SESSION_MAX_MESSAGES + config.SESSION_TEARDOWN_BUFFER:
         logger.error("Counter exceeded hard teardown buffer")
         return {"error": "session_max_messages_reached", "error_source": "verify_node", "wire_packet": None}
@@ -331,7 +312,7 @@ def verify_node(state: GQESLState) -> dict:
             "wire_packet": None,
         }
 
-    # Termination packet detection (idx=4095)
+    # end packet
     if idx == 4095:
         logger.info("Termination packet received (idx=4095) at counter %d", c)
         return {
@@ -340,19 +321,15 @@ def verify_node(state: GQESLState) -> dict:
             "wire_packet": None,
         }
 
-    # Success — null wire_packet to prevent known-plaintext exposure in checkpoint
+    # clear packet
     return {
         "rcc8_relation": r,
         "counter": c + 1,
-        "wire_packet": None,  # Fix #9
+        "wire_packet": None,  # keep empty
         "error": None,
         "error_source": None,
     }
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: decode_node  (Fix #1: W.T inversion)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def decode_node(state: GQESLState) -> dict:
     """Codebook lookup → reverse project using W.T → desalt."""
@@ -360,14 +337,13 @@ def decode_node(state: GQESLState) -> dict:
     keys = get_session_keys(session_id)
     packet_dict = state.get("wire_packet") or {}
 
-    # Get idx from the packet that was verified (we saved relation already)
-    # We need to retrieve idx before it was nulled — it's passed separately
+    # get idx
     idx = state.get("_decoded_idx")
     if idx is None:
-        # Fallback: idx might still be available
+        # fallback
         idx = packet_dict.get("idx", 0)
 
-    counter = state.get("counter", 1) - 1  # Counter was incremented in verify
+    counter = state.get("counter", 1) - 1  # after verify
     salt = compute_salt(keys.salt_seed, counter)
 
     reconstructed = decode_tensor(idx, keys.codebook, salt, keys.W1, keys.W2)
@@ -377,10 +353,6 @@ def decode_node(state: GQESLState) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: rcc8_route_node
-# ═══════════════════════════════════════════════════════════════════════════
-
 def rcc8_route_node(state: GQESLState) -> dict:
     """Read RCC-8 relation and set coordination strategy."""
     relation_str = state.get("rcc8_relation", "DC")
@@ -388,10 +360,6 @@ def rcc8_route_node(state: GQESLState) -> dict:
     strategy = RCC8_STRATEGY_MAP[relation]
     return {"strategy": strategy.value}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# STRATEGY NODES
-# ═══════════════════════════════════════════════════════════════════════════
 
 def exact_dispatch_node(state: GQESLState) -> dict:
     """EQ strategy: execute the decoded task as-is."""
@@ -414,9 +382,30 @@ def handoff_node(state: GQESLState) -> dict:
 def negotiate_node(state: GQESLState) -> dict:
     """DC strategy: concepts disconnected, negotiation required.
 
-    Uses LangGraph interrupt() to pause and wait for a NegotiationResume.
+    Near-matches to warmed/learned vocabulary auto-resolve without interrupt.
+    Otherwise uses LangGraph interrupt() for human review.
     """
     from langgraph.types import interrupt
+
+    session_id = state["session_id"]
+    ledger = get_ledger()
+    decoded = np.array(state["decoded_tensor"], dtype=np.float32)
+    hits = ledger.search(decoded, session_id, k=1)
+    if hits:
+        nearest_id, sim = hits[0]
+        if nearest_id.startswith(("warm_", "learned_")) and sim >= config.AUTO_RESOLVE_THRESHOLD:
+            logger.info(
+                "NEGOTIATE auto-resolved: nearest=%s sim=%.3f (threshold %.2f)",
+                nearest_id,
+                sim,
+                config.AUTO_RESOLVE_THRESHOLD,
+            )
+            ledger.register(
+                decoded,
+                f"learned_auto_{nearest_id}_c{state.get('counter', 0)}",
+                session_id,
+            )
+            return {}
 
     logger.info("NEGOTIATE_FIRST: pausing for negotiation")
 
@@ -445,10 +434,6 @@ def negotiate_node(state: GQESLState) -> dict:
         }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: collapse_node
-# ═══════════════════════════════════════════════════════════════════════════
-
 def collapse_node(state: GQESLState) -> dict:
     """Collapse decoded tensor to nearest concept via argmax."""
     session_id = state["session_id"]
@@ -459,7 +444,7 @@ def collapse_node(state: GQESLState) -> dict:
 
     concept_idx, similarity = collapse_tensor(decoded, basis)
 
-    # Record usage for drift tracking
+    # track drift
     ledger = get_ledger()
     concept_id = f"concept_{concept_idx}"
     ledger.record_usage(concept_id, session_id, decoded)
@@ -470,10 +455,6 @@ def collapse_node(state: GQESLState) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: execute_node  (Fix #2: DeepSeek ephemeral)
-# ═══════════════════════════════════════════════════════════════════════════
-
 def execute_node(state: GQESLState) -> dict:
     """Agent B executes the decoded task.  DeepSeek output is local-scope only."""
     session_id = state["session_id"]
@@ -483,7 +464,7 @@ def execute_node(state: GQESLState) -> dict:
 
     intent_info = collapse_to_intent(decoded, basis)
 
-    # --- DeepSeek call (ephemeral — local scope only) ---
+    # local LLM
     try:
         llm = _get_llm()
         prompt = (
@@ -494,13 +475,13 @@ def execute_node(state: GQESLState) -> dict:
             f"  Priority: {intent_info['priority']:.2f}\n"
             f"Provide a brief structured result."
         )
-        response = llm.invoke(prompt)  # Local var — never in state
-        result_text = response.content[:200]  # Truncate for safety
+        response = llm.invoke(prompt)  # local only
+        result_text = response.content[:200]  # safe trunc
     except Exception as e:
         logger.warning("DeepSeek execution failed: %s", e)
         result_text = "execution_completed"
 
-    # Only structured data enters state
+    # structured only
     return {
         "action_result": [{
             "concept": state.get("collapsed_concept", "unknown"),
@@ -512,16 +493,23 @@ def execute_node(state: GQESLState) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: respond_node
-# ═══════════════════════════════════════════════════════════════════════════
-
 def respond_node(state: GQESLState) -> dict:
     """Build a response tensor and prepare it for sending back."""
     session_id = state["session_id"]
     keys = get_session_keys(session_id)
 
-    # Build a simple acknowledgment tensor
+    ledger = get_ledger()
+    decoded = state.get("decoded_tensor")
+    if decoded is not None:
+        collapsed = state.get("collapsed_concept", "unknown")
+        ctr = state.get("counter", 0)
+        ledger.register(
+            np.array(decoded, dtype=np.float32),
+            f"learned_{collapsed}_c{ctr}",
+            session_id,
+        )
+
+    # build ack
     basis = build_basis_matrix(keys.basis_seed)
     ack_intent = AgentIntent(
         task_type=TaskType.VERIFY,
@@ -534,10 +522,6 @@ def respond_node(state: GQESLState) -> dict:
 
     return {"response_tensor": response_tensor.tolist()}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: drift_monitor_node
-# ═══════════════════════════════════════════════════════════════════════════
 
 def drift_monitor_node(state: GQESLState) -> dict:
     """Check all concepts for drift, trigger re-negotiation if needed."""
@@ -552,10 +536,6 @@ def drift_monitor_node(state: GQESLState) -> dict:
 
     return {}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: error_handler_node
-# ═══════════════════════════════════════════════════════════════════════════
 
 def error_handler_node(state: GQESLState) -> dict:
     """Handle errors from verify, negotiate, or encode nodes."""
@@ -578,10 +558,6 @@ def error_handler_node(state: GQESLState) -> dict:
     return {"error": None, "error_source": None}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: counter_sync_node
-# ═══════════════════════════════════════════════════════════════════════════
-
 def counter_sync_node(state: GQESLState) -> dict:
     """Synchronise counters on reconnect.
 
@@ -591,11 +567,10 @@ def counter_sync_node(state: GQESLState) -> dict:
     keys = get_session_keys(session_id)
     local_counter = state.get("counter", 0)
 
-    # Sign our counter
+    # sign counter
     sync_hmac = sign_packet(keys.hmac_key, 1, 0, "EQ", local_counter)
 
-    # In a real deployment, this would exchange via MessageBus.
-    # For now, we just set the counter (peer counter comes from state).
+    # local sync
     peer_counter = state.get("_peer_counter", local_counter)
     synced = max(local_counter, peer_counter) + 1
 
@@ -604,10 +579,6 @@ def counter_sync_node(state: GQESLState) -> dict:
 
     return {"counter": synced}
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# NODE: session_terminate_node  (Issue #12)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def session_terminate_node(state: GQESLState) -> dict:
     """Tear down session when SESSION_MAX_MESSAGES reached."""

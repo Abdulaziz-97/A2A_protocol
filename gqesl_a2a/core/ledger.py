@@ -25,13 +25,14 @@ from typing import Optional
 import numpy as np
 
 from gqesl_a2a.config import DRIFT_HISTORY_K, DRIFT_THRESHOLD, TENSOR_DIM
+from gqesl_a2a.core.concepts import warm_concept_id
+from gqesl_a2a.core.tensor_builder import AgentIntent, build_basis_matrix, build_intent_tensor
 
 logger = logging.getLogger(__name__)
 
+# RCC-8 rows
+RCC8_LEDGER_PREFIXES: tuple[str, ...] = ("warm_", "learned_")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Data Classes
-# ═══════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class ConceptEntry:
@@ -42,10 +43,6 @@ class ConceptEntry:
     usage_history: list[np.ndarray] = field(default_factory=list)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# In-Memory Semantic Ledger (default backend)
-# ═══════════════════════════════════════════════════════════════════════════
-
 class SemanticLedger:
     """In-memory concept vector store, keyed by session_id.
 
@@ -54,7 +51,7 @@ class SemanticLedger:
     """
 
     def __init__(self) -> None:
-        # session_id → concept_id → ConceptEntry
+        # session map
         self._store: dict[str, dict[str, ConceptEntry]] = defaultdict(dict)
 
     def register(
@@ -70,7 +67,7 @@ class SemanticLedger:
             concept_vector = concept_vector / norm
 
         if concept_id in self._store[session_id]:
-            # Update existing
+            # update
             entry = self._store[session_id][concept_id]
             entry.vector = concept_vector
             entry.usage_history.append(concept_vector.copy())
@@ -124,6 +121,17 @@ class SemanticLedger:
             return None
         return np.stack(list(vectors.values()))
 
+    def get_rcc8_ledger_matrix(self, session_id: str) -> Optional[np.ndarray]:
+        """Stack only warmed / learned vocabulary rows for RCC-8 (not basis drift rows)."""
+        concepts = self._store.get(session_id, {})
+        rows: list[np.ndarray] = []
+        for cid, entry in concepts.items():
+            if cid.startswith(RCC8_LEDGER_PREFIXES):
+                rows.append(entry.vector)
+        if not rows:
+            return None
+        return np.stack(rows)
+
     def record_usage(
         self,
         concept_id: str,
@@ -143,7 +151,7 @@ class SemanticLedger:
             usage_vector = usage_vector / norm
         entry.usage_history.append(usage_vector)
 
-        # Trim history
+        # trim
         if len(entry.usage_history) > DRIFT_HISTORY_K * 2:
             entry.usage_history = entry.usage_history[-DRIFT_HISTORY_K:]
 
@@ -164,7 +172,7 @@ class SemanticLedger:
         if len(recent) < 2:
             return 0.0
 
-        # Compute pairwise cosine similarities with the centroid
+        # centroid sims
         centroid = np.mean(recent, axis=0)
         c_norm = np.linalg.norm(centroid)
         if c_norm < 1e-12:
@@ -176,7 +184,7 @@ class SemanticLedger:
             for v in recent
         ])
 
-        # Variance of cosine similarities — higher means more drift
+        # variance
         return float(np.var(sims))
 
     def update_centroid(
@@ -194,7 +202,7 @@ class SemanticLedger:
         if new_vector is not None:
             new_vec = new_vector.astype(np.float32)
         else:
-            # Auto-compute from recent history
+            # auto centroid
             recent = entry.usage_history[-DRIFT_HISTORY_K:]
             new_vec = np.mean(recent, axis=0).astype(np.float32)
 
@@ -229,9 +237,32 @@ class SemanticLedger:
         self._store.pop(session_id, None)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# LanceDB-backed Ledger (optional persistent backend)
-# ═══════════════════════════════════════════════════════════════════════════
+def warm_ledger(
+    ledger: SemanticLedger,
+    session_id: str,
+    basis_seed: bytes,
+    known_concepts: list[AgentIntent],
+) -> int:
+    """Register normalised intent templates for each known concept (shared vocabulary).
+
+    Uses the same normalisation as ``encode_tensor`` step 1 so RCC-8 matches
+    live traffic regardless of per-message salt.
+    """
+    basis = build_basis_matrix(basis_seed)
+    n = 0
+    for intent in known_concepts:
+        t = build_intent_tensor(intent, basis).astype(np.float64)
+        norm = np.linalg.norm(t)
+        if norm > 0:
+            normalised = (t / norm * 0.5).astype(np.float32)
+        else:
+            normalised = t.astype(np.float32)
+        cid = warm_concept_id(intent)
+        ledger.register(normalised, cid, session_id)
+        n += 1
+        logger.info("Registered warm concept: %s", cid)
+    return n
+
 
 class LanceDBLedger:
     """LanceDB-backed semantic ledger for persistent storage.
@@ -343,7 +374,16 @@ class LanceDBLedger:
             logger.error("LanceDB get_all failed: %s", e)
             return {}
 
-    # --- Async wrappers for production async nodes ---
+    def get_rcc8_ledger_matrix(self, session_id: str) -> Optional[np.ndarray]:
+        if not self._available:
+            return self._fallback.get_rcc8_ledger_matrix(session_id)
+        allv = self.get_all(session_id)
+        rows = [v for cid, v in allv.items() if cid.startswith(RCC8_LEDGER_PREFIXES)]
+        if not rows:
+            return None
+        return np.stack(rows)
+
+    # async wrappers
 
     async def async_register(self, concept_vector, concept_id, session_id):
         loop = asyncio.get_event_loop()
@@ -357,11 +397,11 @@ class LanceDBLedger:
             None, self.search, query_vector, session_id, k
         )
 
-    # Delegate remaining methods to fallback for now
+    # fallback methods
     def drift_score(self, concept_id, session_id):
         if not self._available:
             return self._fallback.drift_score(concept_id, session_id)
-        return 0.0  # LanceDB drift requires usage tracking
+        return 0.0  # drift pending
 
     def update_centroid(self, concept_id, session_id, new_vector=None):
         if not self._available:
@@ -379,11 +419,7 @@ class LanceDBLedger:
             pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Global Ledger Instance
-# ═══════════════════════════════════════════════════════════════════════════
-
-# Shared ledger instance — used by all nodes
+# global ledger
 _ledger: Optional[SemanticLedger] = None
 
 
